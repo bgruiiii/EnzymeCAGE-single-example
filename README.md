@@ -6,7 +6,7 @@
 - 反应侧特征
 - 酶 pocket/GVP 特征
 - 微生物来源、代谢模型、RHEA core-preference 结果
-- 云端待补的 ESM-C 特征清单
+- ESM-C 序列和 pocket-node 特征
 
 ## Example ID
 
@@ -33,8 +33,9 @@
 | `features/reaction/molecule_conformation/` | 本反应涉及分子的 SDF 构象 |
 | `features/enzyme/gvp_pocket_feature.npz` | 本 UID 的 GVP pocket graph feature |
 | `features/enzyme/Q7M0V7_pocket.pdb` | 本 UID 的 pocket PDB |
+| `features/enzyme/Q7M0V7_esm_c_*.npy/.npz` | 本 UID 的 ESM-C sequence/pocket-node 特征 |
 | `features/microbe/*.json` | 微生物侧单条 JSON 结果 |
-| `cloud_needed/` | 云端 ESM-C 待补文件清单和导出脚本 |
+| `cloud_needed/` | ESM-C 云端来源、导出请求和导出脚本 |
 
 ## What Is Included Locally
 
@@ -43,14 +44,18 @@
 - molecule SDF conformations: included
 - enzyme pocket PDB: included
 - enzyme GVP pocket feature: included
+- enzyme ESM-C sequence node feature: included, `{'node_feature': [59, 1152]}`
+- enzyme ESM-C sequence mean feature: included, `[1152]`
+- enzyme ESM-C pocket-node feature: included, `[15, 1152]`
 - microbe source/model/core-preference feature rows: included
 
-## What Still Needs Cloud Export
+## ESM-C Status
 
-ESM-C sequence-level and pocket-node features currently live on `G:\esm` and are not stored locally in this package yet.
-See `cloud_needed/README.md` and `cloud_needed/cloud_feature_request.json`.
+ESM-C sequence-level and pocket-node features are now included under `features/enzyme/`.
+The `cloud_needed/` directory is kept as provenance, showing the cloud paths and export script used to create them.
 
 ## Notes
 
 This is a tiny demonstration package, not a training dataset. It is intended for documentation,
 GitHub upload, and explaining how one full EnzymeCAGE-style example is assembled.
+
