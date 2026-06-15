@@ -1,0 +1,179 @@
+--- train.py.before_r3_patch_20260615	2026-06-15 11:04:15.000000000 +0800
++++ train.py	2026-06-15 11:06:39.000000000 +0800
+@@ -35,7 +35,8 @@
+ import torch.nn.functional as F
+ from sklearn.manifold import TSNE
+ from sklearn.model_selection import train_test_split
+-from torch.utils.data import DataLoader, Dataset
++from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
++import shutil
+ 
+ 
+ # ═══════════════════════════════════════════════════════════════════════════════
+@@ -69,10 +70,10 @@
+ 
+     # ── training ──
+     lr = 3e-4  # full-data: README Data-Sensitive (was 1e-3)
+-    epochs_stage0 = 8           # Stage 0: independent pretrain (full-data: 8, was 20)
++    epochs_stage0 = 5           # R3: reduced from 8 to 5 (R2 was 8)
+     epochs_stage1 = 25          # Stage 1: pairwise contrastive (R2: 25, R1 was 12)
+     epochs_stage2 = 8           # Stage 2: triplet consistency (full-data: 8, was 30)
+-    epochs_stage3 = 10          # Stage 3: closed-loop self-bootstrap (README no suggestion, kept 10)
++    epochs_stage3 = 0           # R3: skip stage 3 (was 10 in R2)
+     batch_size = 4096  # full-data: README Data-Sensitive (was 64)
+     seed = 42
+ 
+@@ -285,6 +286,44 @@
+                 self.concepts[idx], self.ec_ids[idx], idx)
+ 
+ 
++def build_ec4_weighted_sampler(metadata, subset_indices):
++    """Build WeightedRandomSampler with weight = 1/sqrt(EC-4 group size).
++
++    Args:
++        metadata: list of dicts with 'ec_number' field (full dataset)
++        subset_indices: numpy array or list of global indices for the train subset
++
++    Returns:
++        WeightedRandomSampler with len(subset_indices) weights
++    """
++    # Parse EC-4 for subset rows only
++    ec4_keys = []
++    for global_i in subset_indices:
++        ec = metadata[global_i].get("ec_number", "")
++        parsed = _parse_ec4(ec)
++        ec4_keys.append(parsed if parsed != "unknown" else None)
++
++    # Compute group sizes (over subset only)
++    group_sizes = defaultdict(int)
++    for k in ec4_keys:
++        if k is not None:
++            group_sizes[k] += 1
++
++    # Per-sample weight: 1/sqrt(group_size), unknown gets 1.0
++    weights = []
++    for k in ec4_keys:
++        if k is not None and k in group_sizes:
++            weights.append(1.0 / math.sqrt(group_sizes[k]))
++        else:
++            weights.append(1.0)
++
++    return WeightedRandomSampler(
++        weights=weights,
++        num_samples=len(weights),
++        replacement=True,
++    )
++
++
+ # ═══════════════════════════════════════════════════════════════════════════════
+ # Microbe Feature Engineering
+ # ═══════════════════════════════════════════════════════════════════════════════
+@@ -585,7 +624,7 @@
+ # Four-Stage Training
+ # ═══════════════════════════════════════════════════════════════════════════════
+ 
+-def train_four_stages(model, loader, cfg: Config, device: str,
++def train_four_stages(model, uniform_loader, weighted_loader, cfg: Config, device: str,
+                       fba_surrogate=None, enzyme2microbe=None,
+                       output_dir=None):
+     """
+@@ -593,6 +632,8 @@
+     Stage 1: Pairwise contrastive (reaction↔enzyme primary + substrate↔microbe secondary)
+     Stage 2: Triplet consistency (three-way InfoNCE + VICReg + concept anchor)
+     Stage 3: Closed-loop self-bootstrap (FBA surrogate pseudo-labels)
++
++    R3: Uses uniform_loader for stage 0, weighted_loader for stage 1/2.
+     """
+     model.train()
+     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
+@@ -613,8 +654,23 @@
+         else:
+             return 3
+ 
++    # R3: Start with uniform loader for stage 0
++    loader = uniform_loader
++    current_stage = -1
++
+     for epoch in range(total_epochs):
+         stage = get_stage(epoch)
++
++        # R3: Switch loader at stage boundary
++        if stage != current_stage:
++            if stage in (1, 2):
++                loader = weighted_loader
++                if epoch == cfg.epochs_stage0:
++                    print(f"  Stage {stage}: EC-4 weighted sampler activated")
++            else:
++                loader = uniform_loader
++            current_stage = stage
++
+         temperature = temp_sched.get_temperature(epoch)
+         epoch_loss = 0.0
+ 
+@@ -1465,13 +1521,25 @@
+                                 concept_targets,
+                                 [m.get("assembly_accession", "") for m in metadata])
+ 
++    # ── R3: Build two loaders (uniform + weighted) ──
+     if train_idx is not None:
+         train_dataset = torch.utils.data.Subset(dataset, train_idx)
+         test_dataset = torch.utils.data.Subset(dataset, test_idx)
+-        train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True)
+-        test_loader = DataLoader(test_dataset, batch_size=cfg.batch_size, shuffle=False)
++        subset_indices = train_idx
+     else:
+-        train_loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True)
++        train_dataset = dataset
++        subset_indices = list(range(len(dataset)))
++
++    # Uniform loader (stage 0)
++    uniform_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True)
++
++    # R3: EC-4 weighted loader (stage 1, 2)
++    weighted_sampler = build_ec4_weighted_sampler(metadata, subset_indices)
++    weighted_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, sampler=weighted_sampler)
++    print(f"  EC-4 weighted sampler built for {len(subset_indices)} train samples")
++
++    if train_idx is not None:
++        test_loader = DataLoader(test_dataset, batch_size=cfg.batch_size, shuffle=False)
+ 
+     # ── Model ──
+     model = UnifiedSpace(
+@@ -1501,11 +1569,20 @@
+     print(f"  Stage 3 (self-bootstrap):   {cfg.epochs_stage3} epochs")
+     print(f"{'='*60}\n")
+ 
+-    history = train_four_stages(model, train_loader, cfg, device,
++    history = train_four_stages(model, uniform_loader, weighted_loader, cfg, device,
+                                 fba_surrogate=fba_surrogate,
+                                 enzyme2microbe=enzyme2microbe,
+                                 output_dir=out)
+ 
++    # ── R3: Stage 3 alias if skipped ──
++    if cfg.epochs_stage3 == 0:
++        stage2_ckpt = out / "model_v3_stage2.pt"
++        stage3_ckpt = out / "model_v3_stage3.pt"
++        if stage2_ckpt.exists():
++            shutil.copy2(str(stage2_ckpt), str(stage3_ckpt))
++            print(f"  Stage 3 skipped (epochs_stage3=0); "
++                  f"model_v3_stage3.pt is alias of stage2 checkpoint")
++
+     # ── Save checkpoint BEFORE evaluation (protect against eval OOM) ──
+ 
+     print("\nSaving checkpoint before evaluation...")
+@@ -1587,8 +1664,13 @@
+         print(f"  Numpy NN fallback indices saved: {fallback_count} (*_nn_index.npz)")
+ 
+     # ── Visualize ──
+-    visualize_four_modal(metrics, all_r, all_e, all_s, all_m,
+-                         labels, history, out)
++    try:
++        visualize_four_modal(metrics, all_r, all_e, all_s, all_m,
++                             labels, history, out)
++    except Exception as e:
++        print(f"  WARNING: visualize_four_modal failed: {e}")
++        print(f"  PNG visualization skipped; model/embeddings/metrics/index "
++              f"outputs are unaffected.")
+ 
+     print(f"\nAll outputs saved to {out}/")
+     print(f"  model_v3.pt           — model weights + config + inverted index")
